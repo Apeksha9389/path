@@ -1274,6 +1274,50 @@ class TestInPlace:
         assert doc.read_text(encoding='utf-8') == self.reference_content
         assert not (doc + '.bak').exists()
 
+    @pytest.mark.parametrize('error', [KeyboardInterrupt, SystemExit])
+    @pytest.mark.parametrize('stage', ['reader', 'writer', 'body'])
+    def test_base_exception_restores_file(self, tmpdir, monkeypatch, error, stage):
+        doc = self.create_reference(tmpdir)
+        original_open = open
+
+        def interrupt_open(file, *args, **kwargs):
+            if (stage == 'reader' and not isinstance(file, int)) or (
+                stage == 'writer' and isinstance(file, int)
+            ):
+                raise error('interrupted')
+            return original_open(file, *args, **kwargs)
+
+        with monkeypatch.context() as patched:
+            patched.setattr(path, 'open', interrupt_open, raising=False)
+            with (
+                pytest.raises(error, match='interrupted'),
+                doc.in_place(encoding='utf-8') as (_, writer),
+            ):
+                writer.write('replacement')
+                raise error('interrupted')
+        assert doc.read_text(encoding='utf-8') == self.reference_content
+        assert not (doc + '.bak').exists()
+
+    @pytest.mark.parametrize('stage', ['setup', 'body'])
+    def test_failed_restore_retains_backup(self, tmpdir, monkeypatch, stage):
+        doc = self.create_reference(tmpdir)
+        backup = doc + '.bak'
+        original_rename = Path.rename
+
+        def fail_restore(source, destination):
+            if source == backup:
+                raise PermissionError('cannot restore original')
+            return original_rename(source, destination)
+
+        monkeypatch.setattr(Path, 'rename', fail_restore)
+        options = {'encoding': 'missing-codec' if stage == 'setup' else 'utf-8'}
+        with (
+            pytest.raises(PermissionError, match='cannot restore original'),
+            doc.in_place(**options),
+        ):
+            raise RuntimeError('body failed')
+        assert backup.read_text(encoding='utf-8') == self.reference_content
+
     def test_write_mode_invalid(self, tmpdir):
         with (
             pytest.raises(ValueError),

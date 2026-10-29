@@ -1781,12 +1781,12 @@ class Path(str):
                 with contextlib.suppress(OSError, AttributeError):
                     self.chmod(perm)
                 yield readable, writable
-        except Exception:
-            # move backup back after closing any streams opened during setup
+        except BaseException:
+            # Restore on interruption too, retaining the backup if restoration fails.
             self.remove_p()
             backup_fn.rename(self)
             raise
-        finally:
+        else:
             backup_fn.remove_p()
 
     @classes.ClassProperty

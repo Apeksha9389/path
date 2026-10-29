@@ -1318,6 +1318,95 @@ class TestInPlace:
             raise RuntimeError('body failed')
         assert backup.read_text(encoding='utf-8') == self.reference_content
 
+    @pytest.mark.parametrize('error', [KeyboardInterrupt, SystemExit])
+    def test_interrupted_writer_setup_closes_resources(
+        self, tmpdir, monkeypatch, error
+    ):
+        doc = self.create_reference(tmpdir)
+        interruption = error('writer setup interrupted')
+        original_open = open
+        opened = []
+
+        def interrupt_writer(file, *args, **kwargs):
+            if isinstance(file, int):
+                opened.append(file)
+                raise interruption
+            reader = original_open(file, *args, **kwargs)
+            opened.append(reader)
+            return reader
+
+        with monkeypatch.context() as patched:
+            patched.setattr(path, 'open', interrupt_writer, raising=False)
+            with pytest.raises(error) as exc, doc.in_place(encoding='utf-8'):
+                pytest.fail('setup must fail before yielding')
+        assert exc.value is interruption
+        reader, fd = opened
+        assert reader.closed
+        with pytest.raises(OSError):
+            os.fstat(fd)
+        assert doc.read_text(encoding='utf-8') == self.reference_content
+        assert not (doc + '.bak').exists()
+
+    @pytest.mark.parametrize('mode', ['r', 'rb'])
+    @pytest.mark.parametrize(
+        'error', [None, RuntimeError, KeyboardInterrupt, SystemExit]
+    )
+    def test_context_exit_closes_resources(self, tmpdir, mode, error):
+        doc = self.create_reference(tmpdir)
+        doc.chmod(0o640)
+        permissions = stat.S_IMODE(doc.stat().st_mode)
+        failure = error('body failed') if error else None
+        expected_exception = pytest.raises(error) if error else contextlib.nullcontext()
+        replacement = b'replacement' if 'b' in mode else 'replacement'
+        options = {} if 'b' in mode else {'encoding': 'utf-8'}
+        with (
+            expected_exception as exc,
+            doc.in_place(mode=mode, backup_extension='.original', **options) as (
+                reader,
+                writer,
+            ),
+        ):
+            descriptors = [reader.fileno(), writer.fileno()]
+            writer.write(replacement)
+            if failure:
+                raise failure
+        if failure:
+            assert exc.value is failure
+        assert reader.closed
+        assert writer.closed
+        for fd in descriptors:
+            with pytest.raises(OSError):
+                os.fstat(fd)
+        expected = self.reference_content if error else 'replacement'
+        assert doc.read_text(encoding='utf-8') == expected
+        assert stat.S_IMODE(doc.stat().st_mode) == permissions
+        assert not (doc + '.original').exists()
+
+    def test_failed_rollback_unlink_retains_original_backup(self, tmpdir, monkeypatch):
+        doc = self.create_reference(tmpdir)
+        backup = doc + '.bak'
+        body_error = RuntimeError('body failed')
+        rollback_error = PermissionError('cannot remove replacement')
+        original_remove = Path.remove_p
+
+        def fail_remove(target):
+            if target == doc:
+                raise rollback_error
+            return original_remove(target)
+
+        monkeypatch.setattr(Path, 'remove_p', fail_remove)
+        with (
+            pytest.raises(PermissionError) as exc,
+            doc.in_place(encoding='utf-8') as (_, writer),
+        ):
+            writer.write('partial replacement')
+            raise body_error
+        assert exc.value is rollback_error
+        assert exc.value.__context__ is body_error
+        assert writer.closed
+        assert backup.read_text(encoding='utf-8') == self.reference_content
+        assert doc.read_text(encoding='utf-8') == 'partial replacement'
+
     def test_write_mode_invalid(self, tmpdir):
         with (
             pytest.raises(ValueError),
